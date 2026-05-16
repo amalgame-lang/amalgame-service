@@ -115,6 +115,7 @@ run_test() {
 echo "── Amalgame.Service ───────────────────────"
 run_test "not stopping at start"        "[PASS] not stopping at start"
 run_test "install idempotent"           "[PASS] install idempotent"
+run_test "run-as-service idempotent"    "[PASS] run-as-service idempotent"
 run_test "should-stop after request"    "[PASS] should-stop after request"
 run_test "sleep short-circuits"         "[PASS] sleep short-circuits when stopping"
 

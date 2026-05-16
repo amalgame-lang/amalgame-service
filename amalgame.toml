@@ -9,13 +9,13 @@
 # Installation:
 #
 #   amc package add service                  # via curated index
-#   amc package add github.com/amalgame-lang/amalgame-service@v0.1.0
+#   amc package add github.com/amalgame-lang/amalgame-service@v0.2.0
 
 [package]
 name              = "amalgame-service"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
-description       = "Pure-Amalgame service facade: signal handler + ShouldStop + interruptible Sleep."
+description       = "Pure-Amalgame service facade: signal handler + ShouldStop + interruptible Sleep + native Windows SCM dispatcher."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.7.7"
 schema-version    = 1
