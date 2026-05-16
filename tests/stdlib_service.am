@@ -26,6 +26,19 @@ public class Program {
         Service.Install()
         Console.WriteLine("[PASS] install idempotent")
 
+        // RunAsService is the v0.2.0 entry point. On POSIX it's
+        // identical to Install() (still a no-op when chained). On
+        // Windows it additionally bootstraps the SCM dispatcher on
+        // a worker thread; in console mode (which this test runs in)
+        // StartServiceCtrlDispatcher returns immediately with
+        // ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and the binary
+        // keeps behaving like a plain console daemon. We assert the
+        // call returns cleanly and that subsequent ShouldStop/Sleep
+        // still work as expected.
+        Service.RunAsService("amalgame-service-test")
+        Service.RunAsService("amalgame-service-test")
+        Console.WriteLine("[PASS] run-as-service idempotent")
+
         // Programmatic shutdown trigger. Same flag the signal handler
         // would flip — drives the rest of the test from in-process.
         Service.RequestStop()

@@ -15,7 +15,7 @@ namespace Amalgame.Service
 //     public class Program {
 //         public static int Main(List<string> args) {
 //             Log.Info("starting")
-//             Service.Install()
+//             Service.RunAsService("my-daemon")   // see notes below
 //             while (!Service.ShouldStop()) {
 //                 // do one unit of work
 //                 Service.Sleep(5000)
@@ -25,27 +25,53 @@ namespace Amalgame.Service
 //         }
 //     }
 //
+// Two install entry points:
+//
+//   - `Service.Install()` — install the OS signal/Ctrl handler so
+//     `ShouldStop()` flips on SIGTERM / SIGINT (POSIX) or CTRL_C /
+//     CTRL_CLOSE / CTRL_SHUTDOWN (Windows). Console-only; works
+//     anywhere. Backward-compatible — pre-v0.2.0 code keeps using
+//     this exactly as before.
+//
+//   - `Service.RunAsService(name)` — superset of `Install()`. On
+//     Linux/macOS it's identical (the name is ignored). On Windows
+//     it additionally bootstraps the Service Control Manager (SCM)
+//     dispatcher on a background thread so the same binary runs
+//     natively as a Windows service when registered with
+//     `sc create <name> binPath= ...` — no NSSM wrapper exe needed.
+//     Console-mode launch still works (SCM dispatcher returns
+//     immediately with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and
+//     the binary keeps behaving like a plain console daemon).
+//     Cleanup (SetServiceStatus(STOPPED) → SCM connection teardown)
+//     happens automatically at process exit via atexit().
+//
 // Cross-platform: POSIX `signal()` for SIGTERM / SIGINT on Linux
 // and macOS; `SetConsoleCtrlHandler` for CTRL_C / CTRL_CLOSE /
-// CTRL_SHUTDOWN on Windows. Both compile to the same Amalgame
-// surface; callers don't branch on platform.
+// CTRL_SHUTDOWN on Windows; `StartServiceCtrlDispatcher` +
+// `RegisterServiceCtrlHandlerEx` + `SetServiceStatus` for native
+// Windows service mode. All compile to the same Amalgame surface;
+// callers don't branch on platform.
 //
 // Single-process scope. `ShouldStop()` is a single atomic flag —
 // not a per-thread token. If you spawn worker threads, they all
 // observe the same flag, which is what you want for "the whole
 // service is shutting down".
 //
-// History: implementation moved from `runtime/Amalgame_Service.h`
-// to AM (post-v0.7.5). The OS primitives — `sigaction` / signal
-// handler / `nanosleep` / `SetConsoleCtrlHandler` / `Sleep` —
-// have no AM equivalent and stay in `@c { … }` blocks. The shared
-// state global (atomic stopping flag) + handler function live in
-// the top-level `@c { … }` block below.
+// History:
+//   - v0.1.0 — implementation moved from `runtime/Amalgame_Service.h`
+//     to AM (post-v0.7.5). Console-only signal/Ctrl handler.
+//   - v0.2.0 — native Windows SCM dispatcher
+//     (`RunAsService(name)`); drops the NSSM dependency in
+//     `amc new --template service` scaffolds.
+
+@c_link "advapi32"
 
 @c {
     #include <signal.h>
+    #include <stdlib.h>   /* atexit */
     #ifdef _WIN32
         #include <windows.h>
+        #include <string.h>
         static volatile LONG Amalgame_Service_Stopping = 0;
 
         static BOOL WINAPI Amalgame_Service_OnCtrl(DWORD ctrlType) {
@@ -56,6 +82,118 @@ namespace Amalgame.Service
             (void) ctrlType;
             InterlockedExchange(&Amalgame_Service_Stopping, 1);
             return TRUE;
+        }
+
+        /* ── SCM (Service Control Manager) bootstrap ──
+         *
+         * v0.2.0 replaces the NSSM-wrapper pattern (external exe
+         * that spawns our console binary and proxies SCM control
+         * codes) with an in-process SCM dispatcher. The same binary
+         * runs both as a console app (StartServiceCtrlDispatcher
+         * returns ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and we
+         * fall through to console behaviour) and as a native
+         * Windows service (SCM calls ServiceMain on a fresh thread,
+         * which registers the handler, reports RUNNING, then waits
+         * on an event flipped by atexit during process teardown). */
+        static HANDLE                 Amalgame_Service_DispatcherThread = NULL;
+        static HANDLE                 Amalgame_Service_ShutdownEvent    = NULL;
+        static SERVICE_STATUS_HANDLE  Amalgame_Service_StatusHandle     = NULL;
+        static SERVICE_STATUS         Amalgame_Service_Status           = {0};
+        static char*                  Amalgame_Service_Name             = NULL;
+
+        static void Amalgame_Service_ReportStatus(DWORD state, DWORD waitHint) {
+            Amalgame_Service_Status.dwServiceType             = SERVICE_WIN32_OWN_PROCESS;
+            Amalgame_Service_Status.dwCurrentState            = state;
+            Amalgame_Service_Status.dwWin32ExitCode           = NO_ERROR;
+            Amalgame_Service_Status.dwServiceSpecificExitCode = 0;
+            Amalgame_Service_Status.dwWaitHint                = waitHint;
+            Amalgame_Service_Status.dwControlsAccepted        =
+                (state == SERVICE_RUNNING)
+                    ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN)
+                    : 0;
+            if (state == SERVICE_RUNNING || state == SERVICE_STOPPED)
+                Amalgame_Service_Status.dwCheckPoint = 0;
+            else
+                Amalgame_Service_Status.dwCheckPoint++;
+            if (Amalgame_Service_StatusHandle)
+                SetServiceStatus(Amalgame_Service_StatusHandle, &Amalgame_Service_Status);
+        }
+
+        static DWORD WINAPI Amalgame_Service_HandlerEx(
+            DWORD ctrlCode, DWORD evtType, LPVOID evtData, LPVOID ctx)
+        {
+            (void) evtType; (void) evtData; (void) ctx;
+            switch (ctrlCode) {
+                case SERVICE_CONTROL_STOP:
+                case SERVICE_CONTROL_SHUTDOWN:
+                    Amalgame_Service_ReportStatus(SERVICE_STOP_PENDING, 30000);
+                    InterlockedExchange(&Amalgame_Service_Stopping, 1);
+                    if (Amalgame_Service_ShutdownEvent)
+                        SetEvent(Amalgame_Service_ShutdownEvent);
+                    return NO_ERROR;
+                case SERVICE_CONTROL_INTERROGATE:
+                    if (Amalgame_Service_StatusHandle)
+                        SetServiceStatus(Amalgame_Service_StatusHandle,
+                                         &Amalgame_Service_Status);
+                    return NO_ERROR;
+                default:
+                    return ERROR_CALL_NOT_IMPLEMENTED;
+            }
+        }
+
+        static void WINAPI Amalgame_Service_ServiceMain(DWORD argc, LPSTR* argv) {
+            (void) argc; (void) argv;
+            Amalgame_Service_StatusHandle = RegisterServiceCtrlHandlerExA(
+                Amalgame_Service_Name ? Amalgame_Service_Name : "",
+                Amalgame_Service_HandlerEx,
+                NULL);
+            if (!Amalgame_Service_StatusHandle) return;
+
+            Amalgame_Service_ReportStatus(SERVICE_START_PENDING, 5000);
+            Amalgame_Service_ReportStatus(SERVICE_RUNNING, 0);
+
+            /* Park here until the user loop returns from Main()
+             * (atexit signals the event) or SCM sends STOP (handler
+             * signals the event). Either way, ServiceMain returns,
+             * StartServiceCtrlDispatcher returns, and the worker
+             * thread exits cleanly. */
+            if (Amalgame_Service_ShutdownEvent)
+                WaitForSingleObject(Amalgame_Service_ShutdownEvent, INFINITE);
+
+            Amalgame_Service_ReportStatus(SERVICE_STOPPED, 0);
+        }
+
+        static DWORD WINAPI Amalgame_Service_DispatcherFn(LPVOID arg) {
+            (void) arg;
+            SERVICE_TABLE_ENTRYA tbl[] = {
+                { Amalgame_Service_Name ? Amalgame_Service_Name : (LPSTR) "",
+                  Amalgame_Service_ServiceMain },
+                { NULL, NULL }
+            };
+            /* Blocks until ServiceMain returns when running under
+             * SCM; returns ~immediately with
+             * ERROR_FAILED_SERVICE_CONTROLLER_CONNECT when launched
+             * from a console — both are normal outcomes. */
+            StartServiceCtrlDispatcherA(tbl);
+            return 0;
+        }
+
+        static void Amalgame_Service_AtExit(void) {
+            /* Signal ServiceMain to exit (if it was ever entered) so
+             * SCM sees a clean STOPPED transition. Wait briefly for
+             * the dispatcher thread to wind down — capped so a
+             * misbehaving SCM can't keep the process alive. */
+            if (Amalgame_Service_ShutdownEvent)
+                SetEvent(Amalgame_Service_ShutdownEvent);
+            if (Amalgame_Service_DispatcherThread) {
+                WaitForSingleObject(Amalgame_Service_DispatcherThread, 5000);
+                CloseHandle(Amalgame_Service_DispatcherThread);
+                Amalgame_Service_DispatcherThread = NULL;
+            }
+            if (Amalgame_Service_ShutdownEvent) {
+                CloseHandle(Amalgame_Service_ShutdownEvent);
+                Amalgame_Service_ShutdownEvent = NULL;
+            }
         }
     #else
         #include <time.h>
@@ -95,6 +233,56 @@ public class Service {
         }
     }
 
+    // Superset of `Install()` that additionally bootstraps the
+    // native Windows Service Control Manager dispatcher when
+    // running as a service. Call once at the top of `Main()`
+    // instead of `Install()`. The same binary keeps working in
+    // console mode (dispatcher returns immediately) and as a
+    // registered Windows service (dispatcher blocks on a worker
+    // thread until SCM tears the service down). `name` must match
+    // the name used at `sc create <name>` registration time on
+    // Windows; it is ignored on Linux/macOS.
+    //
+    // No follow-up call is required — cleanup is registered via
+    // `atexit()` so the SCM connection drops cleanly when the
+    // process exits, whether the loop returns normally or the
+    // runtime tears down on exception.
+    public static void RunAsService(name: string) {
+        // POSIX path: identical to Install(). Name is ignored —
+        // the OS-level integration on Linux/macOS lives in the
+        // unit file / launchd plist, not the binary.
+        Service.Install()
+        @c {
+        #ifdef _WIN32
+            /* Idempotent: a second call from the same process is a
+             * no-op (the dispatcher thread is already running). */
+            if (Amalgame_Service_DispatcherThread != NULL) return;
+
+            /* strdup the name into a stable buffer — the
+             * SERVICE_TABLE_ENTRY consumed by SCM holds the
+             * pointer for the lifetime of the dispatcher. */
+            if (name && *name) {
+                Amalgame_Service_Name = _strdup(name);
+            } else {
+                Amalgame_Service_Name = _strdup("");
+            }
+
+            /* Manual-reset event so both the handler (on STOP) and
+             * AtExit (on normal teardown) can flip it from any
+             * thread without lost-wakeup races. */
+            Amalgame_Service_ShutdownEvent =
+                CreateEventA(NULL, TRUE, FALSE, NULL);
+
+            Amalgame_Service_DispatcherThread = CreateThread(
+                NULL, 0, Amalgame_Service_DispatcherFn, NULL, 0, NULL);
+
+            atexit(Amalgame_Service_AtExit);
+        #else
+            (void) name;  /* silence unused-param on POSIX */
+        #endif
+        }
+    }
+
     // True after the OS has delivered a shutdown signal. The loop
     // body should check this on every iteration and exit promptly.
     // Calling repeatedly is cheap (single memory read).
@@ -110,6 +298,8 @@ public class Service {
         @c {
         #ifdef _WIN32
             InterlockedExchange(&Amalgame_Service_Stopping, 1);
+            if (Amalgame_Service_ShutdownEvent)
+                SetEvent(Amalgame_Service_ShutdownEvent);
         #else
             Amalgame_Service_Stopping = 1;
         #endif
